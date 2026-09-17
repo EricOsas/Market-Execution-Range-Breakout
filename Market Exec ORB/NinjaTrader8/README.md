@@ -71,23 +71,25 @@ Behavior:
 - HTML/rate-limit responses are rejected rather than parsed as calendar data
 - If realtime trading has no valid Forex Factory data for the current week, the news guard **fails closed** and blocks new entries rather than trading blind
 
+Forex Factory's export is updated roughly hourly and aggressively requesting it is unnecessary, so the strategy intentionally does not poll it every minute/tick.
+
 ### Local cache
 
 Every successful weekly response is stored automatically under:
 
 `Documents\NinjaTrader 8\cache\MarketExecORB\ForexFactory\`
 
-The strategy reloads cached weeks at startup. This means weeks accumulated during live use can later be reused by Strategy Analyzer without manual files.
+The strategy reloads cached weeks at startup. Weeks accumulated during live use can therefore later be reused by Strategy Analyzer without manual files.
 
 ### Historical limitation
 
-Forex Factory's public export is fundamentally a current-week feed. It does not provide this strategy with an official arbitrary-history JSON endpoint.
+Forex Factory's public JSON export is a current-week feed, not an arbitrary historical-data API.
 
 Therefore:
 
 - Live/current-week filtering is automatic.
-- Historical Strategy Analyzer runs can use any weeks already present in the strategy's automatic cache.
-- Old backtest weeks that were never cached cannot be truthfully reconstructed from the current-week feed, so the strategy does not pretend current news data represents those old dates.
+- Historical Strategy Analyzer runs can use weeks already present in the automatic cache.
+- Old backtest weeks that were never cached cannot be truthfully reconstructed from the current-week feed, so the strategy does not apply current news events to unrelated historical dates.
 
 ## Installation
 
