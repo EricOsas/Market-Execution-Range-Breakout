@@ -9,6 +9,7 @@ using System.Linq;
 using System.Windows.Media;
 using NinjaTrader.Cbi;
 using NinjaTrader.Data;
+using NinjaTrader.Gui;
 using NinjaTrader.NinjaScript;
 using NinjaTrader.NinjaScript.DrawingTools;
 #endregion
@@ -86,7 +87,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (State == State.SetDefaults)
             {
                 Name = "ORB Market Exec NT8";
-                Description = "Market-execution opening range breakout. Closed-candle trigger, independent side consumption, side expiry, time exit and blackout flatten.";
+                Description = "Market-execution opening range breakout. Closed-candle trigger, independent side consumption, side expiry, time exit and account blackout flatten.";
                 Calculate = Calculate.OnBarClose;
                 EntriesPerDirection = 1;
                 EntryHandling = EntryHandling.UniqueEntries;
@@ -127,8 +128,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Configure)
             {
-                // A fixed 1-minute execution series lets RangeMinutes and
-                // ConfirmationMinutes stay true user parameters without a dynamic AddDataSeries call.
                 AddDataSeries(BarsPeriodType.Minute, 1);
             }
             else if (State == State.DataLoaded)
@@ -145,7 +144,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (BarsInProgress != 1 || CurrentBars[1] < 2)
                 return;
 
-            // NT minute bars are stamped at bar close. Treat this as [start,end).
             DateTime appBarEnd = Times[1][0];
             DateTime appBarStart = appBarEnd.AddMinutes(-1);
             DateTime refBarStart = ToReferenceTime(appBarStart);
@@ -159,7 +157,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 rangeHigh = Math.Max(rangeHigh, Highs[1][0]);
                 rangeLow = Math.Min(rangeLow, Lows[1][0]);
-
                 if (refBarEnd >= rangeEndLocal)
                     FinalizeRange();
                 return;
@@ -270,10 +267,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             bool wantShort = AllowShort && !shortConsumed && closePrice < rangeLow - buffer;
 
             if (wantLong && wantShort)
-            {
-                Print("[ORB] Ambiguous confirmation close beyond both sides. No order.");
                 return;
-            }
 
             if (wantLong)
             {
@@ -407,9 +401,24 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (State == State.Realtime && Account != null)
             {
-                // Account-level flatten for THIS instrument: cancels working orders and closes the account position.
-                Account.Flatten(new[] { Instrument });
-                Print(string.Format("[ORB] ACCOUNT FLATTEN for {0} at {1:yyyy-MM-dd HH:mm}.", Instrument.FullName, refNow));
+                var instruments = new List<Instrument>();
+                lock (Account.Positions)
+                {
+                    foreach (Position p in Account.Positions)
+                        if (p != null && p.MarketPosition != MarketPosition.Flat && p.Instrument != null && !instruments.Contains(p.Instrument))
+                            instruments.Add(p.Instrument);
+                }
+                lock (Account.Orders)
+                {
+                    foreach (Order o in Account.Orders)
+                        if (o != null && o.Instrument != null && !instruments.Contains(o.Instrument)
+                            && (o.OrderState == OrderState.Accepted || o.OrderState == OrderState.Working || o.OrderState == OrderState.Submitted || o.OrderState == OrderState.TriggerPending))
+                            instruments.Add(o.Instrument);
+                }
+
+                if (instruments.Count > 0)
+                    Account.Flatten(instruments);
+                Print(string.Format("[ORB] ACCOUNT FLATTEN EVERYTHING at {0:yyyy-MM-dd HH:mm}. Instruments={1}.", refNow, instruments.Count));
             }
             else
             {
@@ -517,8 +526,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (line.Length == 0 || line.StartsWith("#"))
                     continue;
 
-                // UTC_ISO,impact,currencies,title
-                // 2026-09-17T12:30:00Z,3,USD,FOMC Rate Decision
                 string[] p = line.Split(new[] { ',' }, 4);
                 if (p.Length < 3)
                     continue;
@@ -621,7 +628,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty]
         [Display(Name = "Blackout Flatten Enabled", GroupName = "6. Blackout", Order = 0,
-            Description = "Realtime: Account.Flatten() for this instrument, cancelling working orders and closing the account position.")]
+            Description = "Realtime: flattens every open account position and working order instrument at the configured blackout time.")]
         public bool BlackoutFlattenEnabled { get; set; }
 
         [NinjaScriptProperty]
@@ -676,7 +683,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty]
         [Display(Name = "News CSV Path", GroupName = "8. News", Order = 3,
-            Description = "Relative path under Documents\\NinjaTrader 8\\. UTC_ISO,impact(1-3),currencies,title.")]
+            Description = "Relative path under Documents\\NinjaTrader 8\\. Format: UTC_ISO,impact(1-3),currencies,title.")]
         public string NewsCsvPath { get; set; }
 
         [NinjaScriptProperty]
