@@ -1,6 +1,0 @@
-# UTC_ISO,impact,currencies,title
-# impact: 1=low, 2=medium, 3=high
-# multiple currencies: USD|EUR
-2026-09-17T12:30:00Z,3,USD,US CPI
-2026-09-17T18:00:00Z,3,USD,FOMC Rate Decision
-2026-09-18T08:00:00Z,2,EUR,ECB Speaker
