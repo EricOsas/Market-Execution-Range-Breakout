@@ -1,15 +1,16 @@
 #region Using declarations
 using System;
 using System.Collections.Generic;
-using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
 using System.Globalization;
 using System.IO;
-using System.Linq;
+using System.Net;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using System.Windows.Media;
 using NinjaTrader.Cbi;
 using NinjaTrader.Data;
-using NinjaTrader.Gui;
+using NinjaTrader.Gui.Tools;
 using NinjaTrader.NinjaScript;
 using NinjaTrader.NinjaScript.DrawingTools;
 #endregion
@@ -40,13 +41,16 @@ namespace NinjaTrader.NinjaScript.Strategies
         Disabled = 0,
         HighOnly = 1,
         HighAndMedium = 2,
-        All = 3
+        AllEconomic = 3
     }
 
     public class ORBMarketExecNT8 : Strategy
     {
         private const string LongSignal = "ORB-L";
         private const string ShortSignal = "ORB-S";
+        private const string ForexFactoryUrl = "https://nfs.faireconomy.media/ff_calendar_thisweek.json";
+        private const int ForexFactoryRefreshMinutes = 65;
+        private const int ForexFactoryRetryMinutes = 10;
 
         private TimeZoneInfo appTimeZone;
         private TimeZoneInfo newYorkTimeZone;
@@ -71,14 +75,21 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime confirmationBucketEnd = DateTime.MinValue;
         private double confirmationClose = double.NaN;
 
+        private readonly object newsSync = new object();
         private readonly List<NewsEvent> newsEvents = new List<NewsEvent>();
-        private DateTime newsFileLastWriteUtc = DateTime.MinValue;
+        private readonly HashSet<DateTime> loadedNewsWeeks = new HashSet<DateTime>();
+        private DateTime nextNewsRefreshUtc = DateTime.MinValue;
+        private bool newsRefreshInFlight;
+        private string newsStatus = "not loaded";
+
+        private static readonly Regex JsonObjectRegex = new Regex(@"\{(?<body>[^{}]*)\}", RegexOptions.Compiled);
+        private static readonly Regex JsonFieldRegex = new Regex(@"""(?<key>title|country|date|impact|forecast|previous|actual)""\s*:\s*""(?<value>(?:\\.|[^""])*)""", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         private class NewsEvent
         {
             public DateTime Utc;
-            public int Impact;
-            public HashSet<string> Currencies;
+            public string Currency;
+            public string Impact;
             public string Title;
         }
 
@@ -87,7 +98,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (State == State.SetDefaults)
             {
                 Name = "ORB Market Exec NT8";
-                Description = "Market-execution opening range breakout. Closed-candle trigger, independent side consumption, side expiry, time exit and account blackout flatten.";
+                Description = "Market-execution ORB with DST-explicit clocks, independent side expiry, account blackout flatten and automatic Forex Factory news filtering.";
                 Calculate = Calculate.OnBarClose;
                 EntriesPerDirection = 1;
                 EntryHandling = EntryHandling.UniqueEntries;
@@ -120,14 +131,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                 FixedQuantity = 0;
                 RoundTurnCommissionPerContract = 0;
                 AssumedSlippageTicksEachSide = 1;
-                NewsMode = OrbNewsMode.Disabled;
+
+                // Self-sufficient default: no URL/file/API key is required from the user.
+                NewsMode = OrbNewsMode.HighOnly;
                 NewsBlockBeforeMinutes = 30;
                 NewsBlockAfterMinutes = 15;
-                NewsCsvPath = "orb_news.csv";
+                BlockBankHolidays = true;
                 DrawObjects = true;
             }
             else if (State == State.Configure)
             {
+                // Internal one-minute series gives deterministic 15m range/confirmation construction
+                // and lets market entries submit immediately after the confirming minute closes.
                 AddDataSeries(BarsPeriodType.Minute, 1);
             }
             else if (State == State.DataLoaded)
@@ -135,7 +150,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 appTimeZone = Core.Globals.GeneralOptions.TimeZoneInfo;
                 newYorkTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
                 fixedEstTimeZone = TimeZoneInfo.CreateCustomTimeZone("ORB Fixed EST", TimeSpan.FromHours(-5), "ORB Fixed EST", "ORB Fixed EST");
-                LoadNewsFile(true);
+                LoadCachedForexFactoryNews();
+            }
+            else if (State == State.Realtime)
+            {
+                QueueForexFactoryRefresh(true);
             }
         }
 
@@ -148,6 +167,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             DateTime appBarStart = appBarEnd.AddMinutes(-1);
             DateTime refBarStart = ToReferenceTime(appBarStart);
             DateTime refBarEnd = ToReferenceTime(appBarEnd);
+
+            if (State == State.Realtime)
+                QueueForexFactoryRefresh(false);
 
             EnsureSession(refBarStart);
             EnforceBlackout(refBarEnd);
@@ -199,8 +221,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             Print(string.Format(CultureInfo.InvariantCulture,
-                "[ORB] Session {0:yyyy-MM-dd}. Clock={1}. Range {2:HH:mm}-{3:HH:mm}. Side expiry {4:HH:mm}. Confirmation={5}m.",
-                activeSessionKey, ClockMode, rangeStartLocal, rangeEndLocal, sideExpiryLocal, ConfirmationMinutes));
+                "[ORB] Session {0:yyyy-MM-dd}. Clock={1}. Range {2:HH:mm}-{3:HH:mm}. Confirm={4}m. Side expiry={5:HH:mm}. News={6} ({7}).",
+                activeSessionKey, ClockMode, rangeStartLocal, rangeEndLocal, ConfirmationMinutes, sideExpiryLocal, NewsMode, newsStatus));
         }
 
         private DateTime ResolveAfterOpen(DateTime sessionOpen, int hour, int minute)
@@ -228,8 +250,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             Print(string.Format(CultureInfo.InvariantCulture,
-                "[ORB] Range captured: high={0} low={1} size={2:F1} ticks.",
-                rangeHigh, rangeLow, (rangeHigh - rangeLow) / TickSize));
+                "[ORB] Range captured: high={0} low={1} size={2:F1} ticks.", rangeHigh, rangeLow, (rangeHigh - rangeLow) / TickSize));
         }
 
         private void ProcessConfirmationMinute(DateTime refStart, DateTime refEnd, double minuteClose)
@@ -259,13 +280,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void EvaluateConfirmationClose(DateTime refCloseTime, double closePrice)
         {
-            if (!rangeCaptured || refCloseTime > sideExpiryLocal)
+            // 09:00 means the side is dead AT 09:00. A bar that closes at 09:00 cannot trigger.
+            if (!rangeCaptured || refCloseTime >= sideExpiryLocal)
                 return;
 
             double buffer = Math.Max(0, BreakoutBufferTicks) * TickSize;
             bool wantLong = AllowLong && !longConsumed && closePrice > rangeHigh + buffer;
             bool wantShort = AllowShort && !shortConsumed && closePrice < rangeLow - buffer;
-
             if (wantLong && wantShort)
                 return;
 
@@ -283,12 +304,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void TryEnter(bool isLong, double confirmationClosePrice, DateTime refCloseTime)
         {
-            if (refCloseTime > sideExpiryLocal)
+            if (refCloseTime >= sideExpiryLocal)
                 return;
 
-            if (IsNewsBlocked(refCloseTime))
+            string newsReason;
+            if (IsNewsBlocked(refCloseTime, out newsReason))
             {
-                Print(string.Format("[ORB] {0} blocked by news at {1:yyyy-MM-dd HH:mm}. Side consumed.", isLong ? "LONG" : "SHORT", refCloseTime));
+                Print(string.Format("[ORB] {0} blocked by Forex Factory news: {1}. Side consumed.", isLong ? "LONG" : "SHORT", newsReason));
                 return;
             }
 
@@ -315,10 +337,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (rr > 0)
                 SetProfitTarget(signal, CalculationMode.Price, Instrument.MasterInstrument.RoundToTickSize(target));
 
+            // Submit on the internal 1-minute execution series, immediately after confirmation closes.
             if (isLong)
-                EnterLong(0, qty, LongSignal);
+                EnterLong(1, qty, LongSignal);
             else
-                EnterShort(0, qty, ShortSignal);
+                EnterShort(1, qty, ShortSignal);
 
             if (DrawObjects)
             {
@@ -331,10 +354,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (rr > 0)
                     Draw.Line(this, prefix + id + "_TP", false, drawStart, target, drawEnd, target, Brushes.DodgerBlue, DashStyleHelper.Dash, 2);
             }
-
-            Print(string.Format(CultureInfo.InvariantCulture,
-                "[ORB] {0} market trigger. close={1} stop={2} target={3} qty={4}.",
-                isLong ? "LONG" : "SHORT", entryReference, stop, rr > 0 ? target.ToString(CultureInfo.InvariantCulture) : "OFF", qty));
         }
 
         private int ComputeQuantity(double riskDistance)
@@ -405,20 +424,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 lock (Account.Positions)
                 {
                     foreach (Position p in Account.Positions)
-                        if (p != null && p.MarketPosition != MarketPosition.Flat && p.Instrument != null && !instruments.Contains(p.Instrument))
+                    {
+                        if (p == null || p.Instrument == null || p.MarketPosition == MarketPosition.Flat)
+                            continue;
+                        if (!instruments.Contains(p.Instrument))
                             instruments.Add(p.Instrument);
-                }
-                lock (Account.Orders)
-                {
-                    foreach (Order o in Account.Orders)
-                        if (o != null && o.Instrument != null && !instruments.Contains(o.Instrument)
-                            && (o.OrderState == OrderState.Accepted || o.OrderState == OrderState.Working || o.OrderState == OrderState.Submitted || o.OrderState == OrderState.TriggerPending))
-                            instruments.Add(o.Instrument);
+                    }
                 }
 
                 if (instruments.Count > 0)
-                    Account.Flatten(instruments);
-                Print(string.Format("[ORB] ACCOUNT FLATTEN EVERYTHING at {0:yyyy-MM-dd HH:mm}. Instruments={1}.", refNow, instruments.Count));
+                    Account.Flatten(instruments.ToArray());
+                Print(string.Format("[ORB] ACCOUNT FLATTEN ALL POSITIONS at {0:yyyy-MM-dd HH:mm}. Instruments={1}.", refNow, instruments.Count));
             }
             else
             {
@@ -429,128 +445,323 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        // -------------------- CLOCK CONVERSION --------------------
         private DateTime ToReferenceTime(DateTime appTime)
         {
             DateTime unspecified = DateTime.SpecifyKind(appTime, DateTimeKind.Unspecified);
             DateTime utc = TimeZoneInfo.ConvertTimeToUtc(unspecified, appTimeZone);
+            return UtcToReference(utc);
+        }
+
+        private DateTime UtcToReference(DateTime utc)
+        {
             TimeZoneInfo target = ClockMode == OrbClockMode.FixedEST ? fixedEstTimeZone : newYorkTimeZone;
-            return TimeZoneInfo.ConvertTimeFromUtc(utc, target);
+            return TimeZoneInfo.ConvertTimeFromUtc(DateTime.SpecifyKind(utc, DateTimeKind.Utc), target);
+        }
+
+        private DateTime ReferenceToUtc(DateTime refTime)
+        {
+            TimeZoneInfo source = ClockMode == OrbClockMode.FixedEST ? fixedEstTimeZone : newYorkTimeZone;
+            return TimeZoneInfo.ConvertTimeToUtc(DateTime.SpecifyKind(refTime, DateTimeKind.Unspecified), source);
         }
 
         private DateTime ToAppTime(DateTime refTime)
         {
-            TimeZoneInfo source = ClockMode == OrbClockMode.FixedEST ? fixedEstTimeZone : newYorkTimeZone;
-            DateTime unspecified = DateTime.SpecifyKind(refTime, DateTimeKind.Unspecified);
-            DateTime utc = TimeZoneInfo.ConvertTimeToUtc(unspecified, source);
+            DateTime utc = ReferenceToUtc(refTime);
             return TimeZoneInfo.ConvertTimeFromUtc(utc, appTimeZone);
         }
 
-        private bool IsNewsBlocked(DateTime refTime)
+        // -------------------- FOREX FACTORY NEWS --------------------
+        // Provider is intentionally not user-configurable. The strategy uses Forex Factory's
+        // public FairEconomy weekly JSON export, caches every good week locally, and never
+        // requests more often than once per 65 minutes.
+        private string NewsCacheDirectory
         {
+            get { return Path.Combine(Core.Globals.UserDataDir, "cache", "MarketExecORB", "ForexFactory"); }
+        }
+
+        private void QueueForexFactoryRefresh(bool force)
+        {
+            if (NewsMode == OrbNewsMode.Disabled)
+                return;
+
+            lock (newsSync)
+            {
+                if (newsRefreshInFlight)
+                    return;
+                if (!force && DateTime.UtcNow < nextNewsRefreshUtc)
+                    return;
+                newsRefreshInFlight = true;
+                nextNewsRefreshUtc = DateTime.UtcNow.AddMinutes(ForexFactoryRefreshMinutes);
+            }
+
+            Task.Run(() =>
+            {
+                bool ok = false;
+                try
+                {
+                    string json = DownloadForexFactoryJson();
+                    List<NewsEvent> parsed = ParseForexFactoryJson(json);
+                    if (parsed.Count == 0)
+                        throw new InvalidDataException("Forex Factory response contained no parseable events.");
+
+                    CacheForexFactoryJson(json, parsed);
+                    MergeNewsEvents(parsed);
+                    ok = true;
+                    lock (newsSync)
+                        newsStatus = "Forex Factory live: " + parsed.Count.ToString(CultureInfo.InvariantCulture) + " events";
+                    Print("[ORB NEWS] " + newsStatus);
+                }
+                catch (Exception ex)
+                {
+                    lock (newsSync)
+                    {
+                        newsStatus = "Forex Factory fetch failed; cache retained: " + ex.Message;
+                        nextNewsRefreshUtc = DateTime.UtcNow.AddMinutes(ForexFactoryRetryMinutes);
+                    }
+                    Print("[ORB NEWS] " + newsStatus);
+                }
+                finally
+                {
+                    lock (newsSync)
+                    {
+                        newsRefreshInFlight = false;
+                        if (ok)
+                            nextNewsRefreshUtc = DateTime.UtcNow.AddMinutes(ForexFactoryRefreshMinutes);
+                    }
+                }
+            });
+        }
+
+        private string DownloadForexFactoryJson()
+        {
+            ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(ForexFactoryUrl);
+            req.Method = "GET";
+            req.Timeout = 10000;
+            req.ReadWriteTimeout = 10000;
+            req.UserAgent = "NinjaTrader-ORBMarketExec/1.0";
+            req.Accept = "application/json,text/plain,*/*";
+            req.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
+
+            using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+            {
+                if (resp.StatusCode != HttpStatusCode.OK)
+                    throw new WebException("HTTP " + ((int)resp.StatusCode).ToString(CultureInfo.InvariantCulture));
+
+                using (StreamReader reader = new StreamReader(resp.GetResponseStream()))
+                {
+                    string raw = reader.ReadToEnd();
+                    string trimmed = raw.TrimStart();
+                    if (!trimmed.StartsWith("[", StringComparison.Ordinal))
+                        throw new InvalidDataException("Non-JSON/denied response received.");
+                    return raw;
+                }
+            }
+        }
+
+        private List<NewsEvent> ParseForexFactoryJson(string json)
+        {
+            var result = new List<NewsEvent>();
+            foreach (Match obj in JsonObjectRegex.Matches(json ?? string.Empty))
+            {
+                var fields = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (Match f in JsonFieldRegex.Matches(obj.Groups["body"].Value))
+                    fields[f.Groups["key"].Value] = JsonUnescape(f.Groups["value"].Value);
+
+                string date;
+                string country;
+                string impact;
+                if (!fields.TryGetValue("date", out date) || !fields.TryGetValue("country", out country) || !fields.TryGetValue("impact", out impact))
+                    continue;
+
+                DateTimeOffset dto;
+                if (!DateTimeOffset.TryParse(date, CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces, out dto))
+                    continue;
+
+                string title;
+                fields.TryGetValue("title", out title);
+                result.Add(new NewsEvent
+                {
+                    Utc = dto.UtcDateTime,
+                    Currency = (country ?? string.Empty).Trim().ToUpperInvariant(),
+                    Impact = (impact ?? string.Empty).Trim(),
+                    Title = title ?? string.Empty
+                });
+            }
+            return result;
+        }
+
+        private string JsonUnescape(string s)
+        {
+            if (string.IsNullOrEmpty(s))
+                return string.Empty;
+            try { return Regex.Unescape(s.Replace("\\/", "/")); }
+            catch { return s; }
+        }
+
+        private DateTime ForexFactoryWeekStart(DateTime utc)
+        {
+            DateTime et = TimeZoneInfo.ConvertTimeFromUtc(DateTime.SpecifyKind(utc, DateTimeKind.Utc), newYorkTimeZone);
+            return et.Date.AddDays(-(int)et.DayOfWeek); // Forex Factory week: Sunday -> Saturday
+        }
+
+        private void MergeNewsEvents(List<NewsEvent> incoming)
+        {
+            lock (newsSync)
+            {
+                foreach (NewsEvent e in incoming)
+                {
+                    DateTime wk = ForexFactoryWeekStart(e.Utc);
+                    loadedNewsWeeks.Add(wk);
+
+                    bool duplicate = false;
+                    for (int i = 0; i < newsEvents.Count; i++)
+                    {
+                        NewsEvent x = newsEvents[i];
+                        if (x.Utc == e.Utc && x.Currency == e.Currency && string.Equals(x.Title, e.Title, StringComparison.Ordinal))
+                        {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (!duplicate)
+                        newsEvents.Add(e);
+                }
+                newsEvents.Sort((a, b) => a.Utc.CompareTo(b.Utc));
+            }
+        }
+
+        private void CacheForexFactoryJson(string json, List<NewsEvent> parsed)
+        {
+            if (parsed == null || parsed.Count == 0)
+                return;
+
+            try
+            {
+                Directory.CreateDirectory(NewsCacheDirectory);
+                DateTime week = ForexFactoryWeekStart(parsed[0].Utc);
+                string weekly = Path.Combine(NewsCacheDirectory, "ff_calendar_" + week.ToString("yyyyMMdd", CultureInfo.InvariantCulture) + ".json");
+                string latest = Path.Combine(NewsCacheDirectory, "ff_calendar_latest.json");
+                File.WriteAllText(weekly, json);
+                File.WriteAllText(latest, json);
+            }
+            catch (Exception ex)
+            {
+                Print("[ORB NEWS] Cache write failed: " + ex.Message);
+            }
+        }
+
+        private void LoadCachedForexFactoryNews()
+        {
+            try
+            {
+                if (!Directory.Exists(NewsCacheDirectory))
+                {
+                    newsStatus = "no Forex Factory cache yet";
+                    return;
+                }
+
+                int loaded = 0;
+                foreach (string file in Directory.GetFiles(NewsCacheDirectory, "ff_calendar_*.json"))
+                {
+                    try
+                    {
+                        List<NewsEvent> parsed = ParseForexFactoryJson(File.ReadAllText(file));
+                        if (parsed.Count == 0)
+                            continue;
+                        MergeNewsEvents(parsed);
+                        loaded += parsed.Count;
+                    }
+                    catch { }
+                }
+                newsStatus = loaded > 0 ? "cache loaded: " + loaded.ToString(CultureInfo.InvariantCulture) + " events" : "cache empty";
+                Print("[ORB NEWS] " + newsStatus);
+            }
+            catch (Exception ex)
+            {
+                newsStatus = "cache load failed: " + ex.Message;
+                Print("[ORB NEWS] " + newsStatus);
+            }
+        }
+
+        private HashSet<string> RelevantCurrencies()
+        {
+            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            string n = Instrument.MasterInstrument.Name.ToUpperInvariant();
+
+            if (n.StartsWith("6E") || n.StartsWith("M6E")) { set.Add("EUR"); set.Add("USD"); return set; }
+            if (n.StartsWith("6B") || n.StartsWith("M6B")) { set.Add("GBP"); set.Add("USD"); return set; }
+            if (n.StartsWith("6J") || n.StartsWith("M6J")) { set.Add("JPY"); set.Add("USD"); return set; }
+            if (n.StartsWith("6A") || n.StartsWith("M6A")) { set.Add("AUD"); set.Add("USD"); return set; }
+            if (n.StartsWith("6C") || n.StartsWith("M6C")) { set.Add("CAD"); set.Add("USD"); return set; }
+            if (n.StartsWith("6S") || n.StartsWith("M6S")) { set.Add("CHF"); set.Add("USD"); return set; }
+            if (n.StartsWith("6N") || n.StartsWith("M6N")) { set.Add("NZD"); set.Add("USD"); return set; }
+
+            // Equity index, metals and energy futures used by this strategy are USD-sensitive.
+            set.Add("USD");
+            return set;
+        }
+
+        private bool ImpactAllowed(string impact)
+        {
+            if (string.Equals(impact, "High", StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (NewsMode == OrbNewsMode.HighAndMedium && string.Equals(impact, "Medium", StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (NewsMode == OrbNewsMode.AllEconomic &&
+                (string.Equals(impact, "Medium", StringComparison.OrdinalIgnoreCase) || string.Equals(impact, "Low", StringComparison.OrdinalIgnoreCase)))
+                return true;
+            return false;
+        }
+
+        private bool IsNewsBlocked(DateTime refTime, out string reason)
+        {
+            reason = string.Empty;
             if (NewsMode == OrbNewsMode.Disabled)
                 return false;
 
-            LoadNewsFile(false);
-            if (newsEvents.Count == 0)
-                return false;
+            DateTime utc = ReferenceToUtc(refTime);
+            DateTime requiredWeek = ForexFactoryWeekStart(utc);
+            HashSet<string> currencies = RelevantCurrencies();
+            int before = Math.Max(0, NewsBlockBeforeMinutes);
+            int after = Math.Max(0, NewsBlockAfterMinutes);
 
-            DateTime app = ToAppTime(refTime);
-            DateTime utc = TimeZoneInfo.ConvertTimeToUtc(DateTime.SpecifyKind(app, DateTimeKind.Unspecified), appTimeZone);
-            string instrumentCurrency = GuessCurrency();
-            TimeSpan before = TimeSpan.FromMinutes(Math.Max(0, NewsBlockBeforeMinutes));
-            TimeSpan after = TimeSpan.FromMinutes(Math.Max(0, NewsBlockAfterMinutes));
-
-            foreach (NewsEvent ev in newsEvents)
+            lock (newsSync)
             {
-                if (!ImpactAllowed(ev.Impact))
-                    continue;
-                if (ev.Currencies.Count > 0 && !ev.Currencies.Contains(instrumentCurrency) && !ev.Currencies.Contains("ALL"))
-                    continue;
-                if (utc >= ev.Utc - before && utc <= ev.Utc + after)
-                    return true;
-            }
-            return false;
-        }
-
-        private bool ImpactAllowed(int impact)
-        {
-            if (NewsMode == OrbNewsMode.All) return true;
-            if (NewsMode == OrbNewsMode.HighOnly) return impact >= 3;
-            if (NewsMode == OrbNewsMode.HighAndMedium) return impact >= 2;
-            return false;
-        }
-
-        private string GuessCurrency()
-        {
-            string name = Instrument.MasterInstrument.Name.ToUpperInvariant();
-            if (name.StartsWith("6E") || name.StartsWith("M6E")) return "EUR";
-            if (name.StartsWith("6B") || name.StartsWith("M6B")) return "GBP";
-            if (name.StartsWith("6J") || name.StartsWith("M6J")) return "JPY";
-            if (name.StartsWith("6A") || name.StartsWith("M6A")) return "AUD";
-            if (name.StartsWith("6C") || name.StartsWith("M6C")) return "CAD";
-            if (name.StartsWith("6S") || name.StartsWith("M6S")) return "CHF";
-            if (name.StartsWith("6N") || name.StartsWith("M6N")) return "NZD";
-            return "USD";
-        }
-
-        private string ResolveNewsCsvPath()
-        {
-            if (Path.IsPathRooted(NewsCsvPath))
-                return NewsCsvPath;
-            return Path.Combine(Core.Globals.UserDataDir, NewsCsvPath);
-        }
-
-        private void LoadNewsFile(bool force)
-        {
-            if (NewsMode == OrbNewsMode.Disabled && !force)
-                return;
-
-            string path = ResolveNewsCsvPath();
-            if (!File.Exists(path))
-            {
-                if (force && NewsMode != OrbNewsMode.Disabled)
-                    Print("[ORB] News CSV not found: " + path);
-                newsEvents.Clear();
-                return;
-            }
-
-            DateTime writeUtc = File.GetLastWriteTimeUtc(path);
-            if (!force && writeUtc == newsFileLastWriteUtc)
-                return;
-
-            newsFileLastWriteUtc = writeUtc;
-            newsEvents.Clear();
-            foreach (string raw in File.ReadAllLines(path))
-            {
-                string line = raw.Trim();
-                if (line.Length == 0 || line.StartsWith("#"))
-                    continue;
-
-                string[] p = line.Split(new[] { ',' }, 4);
-                if (p.Length < 3)
-                    continue;
-
-                DateTime utc;
-                int impact;
-                if (!DateTime.TryParse(p[0], CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out utc))
-                    continue;
-                if (!int.TryParse(p[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out impact))
-                    continue;
-
-                HashSet<string> ccys = new HashSet<string>(
-                    p[2].Split(new[] { '|', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries)
-                        .Select(x => x.Trim().ToUpperInvariant()));
-
-                newsEvents.Add(new NewsEvent
+                // Live fail-safe: if this week's FF data has never been obtained, do not trade blind.
+                if (State == State.Realtime && !loadedNewsWeeks.Contains(requiredWeek))
                 {
-                    Utc = utc,
-                    Impact = impact,
-                    Currencies = ccys,
-                    Title = p.Length >= 4 ? p[3].Trim() : ""
-                });
+                    reason = "Forex Factory current-week data unavailable (fail-closed)";
+                    return true;
+                }
+
+                for (int i = 0; i < newsEvents.Count; i++)
+                {
+                    NewsEvent e = newsEvents[i];
+                    if (!currencies.Contains(e.Currency))
+                        continue;
+
+                    if (BlockBankHolidays && string.Equals(e.Impact, "Holiday", StringComparison.OrdinalIgnoreCase))
+                    {
+                        DateTime eventRef = UtcToReference(e.Utc);
+                        if (eventRef.Date == refTime.Date)
+                        {
+                            reason = e.Currency + " bank holiday: " + e.Title;
+                            return true;
+                        }
+                    }
+
+                    if (!ImpactAllowed(e.Impact))
+                        continue;
+                    if (utc >= e.Utc.AddMinutes(-before) && utc <= e.Utc.AddMinutes(after))
+                    {
+                        reason = string.Format(CultureInfo.InvariantCulture, "{0} {1} at {2:HH:mm} ({3})", e.Currency, e.Title, UtcToReference(e.Utc), e.Impact);
+                        return true;
+                    }
+                }
             }
-            newsEvents.Sort((a, b) => a.Utc.CompareTo(b.Utc));
-            Print(string.Format("[ORB] Loaded {0} news events from {1}.", newsEvents.Count, path));
+            return false;
         }
 
         #region Properties
@@ -595,7 +806,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty]
         [Range(0, 23)]
         [Display(Name = "Side Expiry Hour", GroupName = "3. Entry Cutoff", Order = 0,
-            Description = "After this clock time, any untriggered side expires until the next range reset.")]
+            Description = "At this time any still-untriggered side expires until the next ORB reset.")]
         public int SideExpiryHour { get; set; }
 
         [NinjaScriptProperty]
@@ -628,7 +839,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty]
         [Display(Name = "Blackout Flatten Enabled", GroupName = "6. Blackout", Order = 0,
-            Description = "Realtime: flattens every open account position and working order instrument at the configured blackout time.")]
+            Description = "Realtime: flattens every open position on the connected account at the configured blackout time.")]
         public bool BlackoutFlattenEnabled { get; set; }
 
         [NinjaScriptProperty]
@@ -649,7 +860,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty]
         [Range(0, double.MaxValue)]
         [Display(Name = "Starting Account Value", GroupName = "7. Risk", Order = 1,
-            Description = "Historical/Analyzer sizing basis. Realtime uses connected account CashValue when available.")]
+            Description = "Historical/Strategy Analyzer sizing basis. Realtime uses connected account CashValue when available.")]
         public double StartingAccountValue { get; set; }
 
         [NinjaScriptProperty]
@@ -668,23 +879,23 @@ namespace NinjaTrader.NinjaScript.Strategies
         public int AssumedSlippageTicksEachSide { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "News Mode", GroupName = "8. News", Order = 0)]
+        [Display(Name = "News Filter", GroupName = "8. Forex Factory News", Order = 0,
+            Description = "Automatic Forex Factory/FairEconomy feed. No URL, CSV, API key or manual event entry required.")]
         public OrbNewsMode NewsMode { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 1440)]
-        [Display(Name = "Block Before Minutes", GroupName = "8. News", Order = 1)]
+        [Display(Name = "Block Before Minutes", GroupName = "8. Forex Factory News", Order = 1)]
         public int NewsBlockBeforeMinutes { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 1440)]
-        [Display(Name = "Block After Minutes", GroupName = "8. News", Order = 2)]
+        [Display(Name = "Block After Minutes", GroupName = "8. Forex Factory News", Order = 2)]
         public int NewsBlockAfterMinutes { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "News CSV Path", GroupName = "8. News", Order = 3,
-            Description = "Relative path under Documents\\NinjaTrader 8\\. Format: UTC_ISO,impact(1-3),currencies,title.")]
-        public string NewsCsvPath { get; set; }
+        [Display(Name = "Block Bank Holidays", GroupName = "8. Forex Factory News", Order = 3)]
+        public bool BlockBankHolidays { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name = "Draw Objects", GroupName = "9. Visuals", Order = 0)]
