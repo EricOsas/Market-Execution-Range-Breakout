@@ -83,7 +83,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private string newsStatus = "not loaded";
 
         private static readonly Regex JsonObjectRegex = new Regex(@"\{(?<body>[^{}]*)\}", RegexOptions.Compiled);
-        private static readonly Regex JsonFieldRegex = new Regex(@"""(?<key>title|country|date|impact|forecast|previous|actual)""\s*:\s*""(?<value>(?:\\.|[^""])*)""", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        private static readonly Regex JsonFieldRegex = new Regex("\\\"(?<key>title|country|date|impact|forecast|previous|actual)\\\"\\s*:\\s*\\\"(?<value>(?:\\\\.|[^\\\"])*)\\\"", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         private class NewsEvent
         {
